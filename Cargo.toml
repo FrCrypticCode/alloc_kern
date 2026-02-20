@@ -1,0 +1,10 @@
+[package]
+name = "alloc_kern"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "alloc_kern"
+path = "src/lib.rs"
+
+[dependencies]
