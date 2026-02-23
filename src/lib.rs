@@ -8,13 +8,14 @@ struct IdEntry{
 }
 
 #[derive(Clone,Copy)]
-struct VirtualAddr{
+pub struct VirtualAddr{
     id:u16,
-    pos:u16
+    pos:u16,
+    ord:u16
 }
 impl VirtualAddr{
-    pub fn new(id:u16,pos:u16)->Self{
-        VirtualAddr { id, pos }
+    pub fn new(id:u16,pos:u16,ord:u16)->Self{
+        VirtualAddr { id, pos, ord }
     }
     pub fn get_pid(&self)->u16{self.id}
     pub fn get_pos(&self)->u16{self.pos}
@@ -26,14 +27,14 @@ struct PhysFrame{
 }
 
 #[derive(Debug)]
-enum AllocResult{
+pub enum AllocResult{
     AllocSuccess,
     AlreadyAlloc,
-    NoMemory
+    NotEnoughMemory
 }
 
 #[derive(Debug)]
-enum DesallocResult{
+pub enum DesallocResult{
     DesallocSuccess,
     AlreadyFree
 }
@@ -78,7 +79,6 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
                 self.lock(rng);
                 self.offset = core::cmp::max(self.offset,ptr+need);
                 return Some(PhysFrame {frame:ptr,ptr:self.bytes[rngbytes.0..rngbytes.1].as_mut_ptr()})
-                //return Some((ptr,self.bytes[rngbytes.0..rngbytes.1].as_mut_ptr()))
             },
             AllocResult::AlreadyAlloc=>{
                 if let Some(p) = self.find_hole(need){
@@ -92,7 +92,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
                 }
                 None
             },
-            AllocResult::NoMemory=>{None}
+            _=>{None}
         }  
     }
     fn find_hole(&self,need:usize)->Option<(IdFrame)>{
@@ -149,45 +149,74 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
     fn unlock(&mut self,rng:(IdFrame,IdFrame)){for f in self.bitmap[rng.0..rng.1].iter_mut(){*f=0;}}
     //
     //Virtualize Part - Not functionnaly
-    pub fn alloc(&mut self,process:u16,need:usize){ // ->Result<(*mut u8,AllocResult)>
+    pub fn alloc(&mut self,process:u16,need:usize)->(Option<VirtualAddr>,AllocResult){ // ->Result<(*mut u8,AllocResult)>
+        // Estimate number of frames need
         let nb_frames:usize;
         if need%self.frame_size()!=0{nb_frames=need/self.frame_size()+1;}
         else{nb_frames=need /self.frame_size();}
+        // Checking if we have enough memory
+        // One Virtual Slot = One PhysFrame
+        let free_virt = self.nb_virt_free();
+        let free_frame =self.nb_phys_frame();
+        if free_virt<nb_frames || free_frame<nb_frames{
+            return (None,AllocResult::NotEnoughMemory)
+        }
+        let mut virt_addr:VirtualAddr = VirtualAddr { id: 0, pos: 0, ord: 0 };
         // All frames needed are allocate at the first request => Perfect bloc allocate
-        if let Some(mem) = self.alloc_phys(nb_frames){
-            let new =IdEntry{
-                addr: VirtualAddr::new(mem.frame as u16,0),
-                frame:mem.frame as u16,
-                ptr:mem.ptr
-            };
-            for i in self.ids.iter_mut(){
-                if i.is_none(){*i=Some(new);}
+        if let Some(mem) = self.alloc_phys(nb_frames){ 
+            for i in 0..nb_frames{
+                let new =IdEntry{
+                    addr: VirtualAddr::new(process as u16,0,i as u16),
+                    frame:(mem.frame+i) as u16,
+                    ptr:mem.ptr.wrapping_add(i*self.frame_size())
+                };
+                if new.addr.ord==0{virt_addr = new.addr.clone()}
+                for i in self.ids.iter_mut(){
+                    if i.is_none(){*i=Some(new);break;}
+                }
             }
+            return (Some(virt_addr),AllocResult::AllocSuccess)
+            
         }
+        // Frames are splited, need to request multiples times to make a perfect virtual access
         else{
-            // Frames are splited, need to request multiples times to make a perfect virtual access
-            // get_part_frame !!!
-        }
-        /*
-            struct IdEntry{
-                id:u16,
-                addr:u16,
-                frame:u16,
-                ptr:*mut u8
+            let mut frame_to_find = nb_frames;
+            let mut ord = 0;
+            while frame_to_find != 0{
+                if let Some(x) = self.get_part_frame(frame_to_find){
+                    for i in ord..ord+x.1{
+                        let new =IdEntry{
+                            addr: VirtualAddr::new(process as u16,0,i as u16),
+                            frame:(x.0.frame+i) as u16,
+                            ptr:x.0.ptr.wrapping_add(i*self.frame_size())
+                        };
+                        if new.addr.ord==0{virt_addr = new.addr.clone()}
+                        for i in self.ids.iter_mut(){
+                            if i.is_none(){*i=Some(new);break;}
+                        }
+                    }
+                    frame_to_find -= x.1;
+                    ord += x.1;
+                }
             }
-        */
+            (Some(virt_addr),AllocResult::AllocSuccess)
+            
+        }
     }
-    fn get_part_frame(&mut self,size:usize)->Option<PhysFrame>{  //
-        if size == 0{
-            return None
-        }
-        if let Some(f) = self.alloc_phys(size){
-            return Some(f)
-        }
-        else{
-            return self.get_part_frame(size/2)
-        }
-        
+    fn get_part_frame(&mut self,size:usize)->Option<(PhysFrame,usize)>{  //
+        if size == 0{return None}
+        if let Some(f) = self.alloc_phys(size){return Some((f,size))}
+        else{return self.get_part_frame(size/2)}
+    }
+    fn nb_virt_free(&self)->usize{
+        let mut nb = 0;
+        for i in self.ids.iter(){if i.is_some(){nb+=1;}}
+        return nb
+    }
+    fn nb_phys_frame(&self)->usize{
+        let mut nb = 0;
+        for i in self.bitmap.iter(){if *i==0{nb+=1;}}
+        return nb
     }
     pub fn desalloc(&mut self,process:u16)->DesallocResult{
         DesallocResult::DesallocSuccess
