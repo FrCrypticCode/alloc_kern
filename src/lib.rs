@@ -7,6 +7,11 @@ struct IdEntry{
     ptr:*mut u8
 }
 
+struct VirtualIndex<const V:usize>{
+    id:usize,
+    id_virt:[usize;V]
+}
+
 #[derive(Clone,Copy)]
 pub struct VirtualAddr{
     id:u16,
@@ -21,9 +26,9 @@ impl VirtualAddr{
     pub fn get_pos(&self)->u16{self.pos}
 }
 
-struct PhysFrame{
-    frame:IdFrame,
-    ptr:*mut u8
+pub struct PhysFrame{
+    pub frame:[IdFrame;2],  //StartIdFrame, length of lock
+    ptr:*mut u8 // Inutile ?
 }
 
 #[derive(Debug)]
@@ -38,11 +43,11 @@ pub enum DesallocResult{
     DesallocSuccess,
     AlreadyFree
 }
-type IdFrame = usize;   // Réflexion sur le type : usize peut être trop volumineux
+type IdFrame = usize;   
 pub struct Allocator<const N:usize,const S:usize,const F:usize>{
     bytes:[u8;N],
     ids:[Option<IdEntry>;S],
-    bitmap:[u8;F],
+    pub bitmap:[u8;F],
     offset:usize,
 }
 impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
@@ -60,7 +65,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
     const fn slots(&self)->usize{return self.bitmap.len()}
     const fn frame_size(&self)->usize{return N/F}
     // Physical Allocate
-    fn alloc_phys(&mut self,need:usize)->Option<PhysFrame>{
+    pub fn alloc_phys(&mut self,need:usize)->Option<PhysFrame>{
         if need == 0 || need>self.slots(){return None}
         let ptr:usize;
         if self.offset+need>self.bitmap.len(){
@@ -78,7 +83,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
             AllocResult::AllocSuccess=>{
                 self.lock(rng);
                 self.offset = core::cmp::max(self.offset,ptr+need);
-                return Some(PhysFrame {frame:ptr,ptr:self.bytes[rngbytes.0..rngbytes.1].as_mut_ptr()})
+                return Some(PhysFrame {frame:[ptr,need],ptr:self.bytes[rngbytes.0..rngbytes.1].as_mut_ptr()})
             },
             AllocResult::AlreadyAlloc=>{
                 if let Some(p) = self.find_hole(need){
@@ -87,7 +92,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
                     if let AllocResult::AllocSuccess = self.verify_alloc(rng){
                         self.lock(rng);
                         self.offset = core::cmp::max(self.offset,p+need);
-                        return Some(PhysFrame {frame:ptr,ptr:self.bytes[rngbytes.0..rngbytes.1].as_mut_ptr()})
+                        return Some(PhysFrame {frame:[p,need],ptr:self.bytes[rngbytes.0..rngbytes.1].as_mut_ptr()})
                     }
                 }
                 None
@@ -117,14 +122,11 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
     }
     fn lock(&mut self,rng:(IdFrame,IdFrame)){for d in self.bitmap[rng.0..rng.1].iter_mut(){*d=1}}
     // Physical Desallocate
-    fn free_phys(&mut self,slots:&mut [u8])->bool{
-        let ptr = slots.as_ptr() as usize;
-        let start = self.bytes.as_ptr() as usize;
-        let start_frame = (ptr - start)/self.frame_size();
-        let rng = (start_frame,start_frame+slots.len()/self.frame_size());
+    pub fn free_phys(&mut self,slot:PhysFrame)->bool{
+        let rng = (slot.frame[0],slot.frame[0]+slot.frame[1]);
         match self.verify_desalloc(rng){
             DesallocResult::DesallocSuccess=>{
-                self.unlock((rng.0,rng.1));
+                self.unlock(rng);
                 if self.offset != 0{
                     let mut i = self.offset-1;
                     loop{
@@ -146,9 +148,14 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         }
         return DesallocResult::DesallocSuccess
     }
-    fn unlock(&mut self,rng:(IdFrame,IdFrame)){for f in self.bitmap[rng.0..rng.1].iter_mut(){*f=0;}}
+    fn unlock(&mut self,rng:(IdFrame,IdFrame)){
+        for f in self.bitmap[rng.0..rng.1].iter_mut(){*f=0;}
+        let rngbytes = (rng.0*self.frame_size(),rng.1*self.frame_size());
+        for b in self.bytes[rngbytes.0..rngbytes.1].iter_mut(){*b = 0}
+    }
     //
     //Virtualize Part - Not functionnaly
+    // A redéfinir - PhysFrame contient une range désormais
     pub fn alloc(&mut self,process:u16,need:usize)->(Option<VirtualAddr>,AllocResult){ // ->Result<(*mut u8,AllocResult)>
         // Estimate number of frames need
         let nb_frames:usize;
@@ -167,7 +174,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
             for i in 0..nb_frames{
                 let new =IdEntry{
                     addr: VirtualAddr::new(process as u16,0,i as u16),
-                    frame:(mem.frame+i) as u16,
+                    frame:(mem.frame[0]+i) as u16,
                     ptr:mem.ptr.wrapping_add(i*self.frame_size())
                 };
                 if new.addr.ord==0{virt_addr = new.addr.clone()}
@@ -187,7 +194,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
                     for i in ord..ord+x.1{
                         let new =IdEntry{
                             addr: VirtualAddr::new(process as u16,0,i as u16),
-                            frame:(x.0.frame+i) as u16,
+                            frame:(x.0.frame[0]+i) as u16,
                             ptr:x.0.ptr.wrapping_add(i*self.frame_size())
                         };
                         if new.addr.ord==0{virt_addr = new.addr.clone()}
@@ -210,7 +217,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
     }
     fn nb_virt_free(&self)->usize{
         let mut nb = 0;
-        for i in self.ids.iter(){if i.is_some(){nb+=1;}}
+        for i in self.ids.iter(){if i.is_none(){nb+=1;}}
         return nb
     }
     fn nb_phys_frame(&self)->usize{
@@ -230,3 +237,40 @@ const fn sqrt2(mut size:usize)->bool{
     size == 1
 }
 
+#[cfg(test)]
+mod tests{
+    use crate::Allocator;
+    #[test]
+    fn test_generate(){
+        let a = Allocator::<4096,64,64>::new();
+        assert_eq!(a.is_some(),true);
+    }
+    #[test]
+    fn test_bytes(){
+        let a = Allocator::<4096,64,64>::new();
+        assert_eq!(a.unwrap().bytes.len(),4096)
+    }
+    #[test]
+    fn test_virt(){
+        let a = Allocator::<4096,64,64>::new();
+        assert_eq!(a.unwrap().ids.len(),64)
+    }
+    #[test]
+    fn test_frames(){
+        let a = Allocator::<4096,64,64>::new();
+        assert_eq!(a.unwrap().bitmap.len(),64)
+    }
+    #[test]
+    fn test_alloc(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        a.alloc_phys(4);
+        assert_eq!(a.nb_phys_frame(),64-4);
+    }
+    #[test]
+    fn test_free(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let frame = a.alloc_phys(4);
+        a.free_phys(frame.unwrap());
+        assert_eq!(a.nb_phys_frame(),64);
+    }
+}
