@@ -8,10 +8,10 @@ struct IdEntry{
     frame:PhysFrame
 }
 
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,PartialEq)]
 pub struct VirtualAddr{
     id:u16,
-    pos:u32,
+    pos:u32,    // Offset Virtual Memory
 }
 impl VirtualAddr{
     pub fn new(id:u16,pos:u32)->Self{
@@ -37,7 +37,7 @@ impl PhysFrame{
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug,PartialEq)]
 pub enum AllocResult{
     AllocSuccess,
     AllocPartial(usize),
@@ -45,13 +45,14 @@ pub enum AllocResult{
     NotEnoughMemory
 }
 
-#[derive(Debug)]
+#[derive(Debug,PartialEq)]
 pub enum DesallocResult{
     DesallocSuccess,
     AlreadyFree,
     MemoryLeak,
 }
 type IdFrame = usize;   
+type Octets = usize;
 pub struct Allocator<const N:usize,const S:usize,const F:usize>{
     bytes:[u8;N],
     ids:[Option<IdEntry>;S],
@@ -162,8 +163,8 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         for b in self.bytes[rngbytes.0..rngbytes.1].iter_mut(){*b = 0}
     }
     //
-    //Virtualize Part - Not functionnaly
-    pub fn alloc(&mut self,process:u16,need:usize)->(Option<VirtualAddr>,AllocResult){ // ->Result<(*mut u8,AllocResult)>
+    //Virtualize Part - Octet Need
+    pub fn alloc(&mut self,process:u16,need:Octets)->(Option<VirtualAddr>,AllocResult){ // ->Result<(*mut u8,AllocResult)>
         // Estimate number of frames need
         let nb_frames:usize;
         if need%self.frame_size()!=0{nb_frames=need/self.frame_size()+1;}
@@ -171,13 +172,13 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         // Checking if we have enough memory
         // One Virtual Slot = One Slice of PhysFrame resumed as struct PhysFrame
         let free_frame =self.nb_phys_frame();
-        if free_frame<nb_frames && self.nb_virt_free()!=0{
+        if free_frame<nb_frames || self.nb_virt_free()==0{
             return (None,AllocResult::NotEnoughMemory)
         }
         let mut attr = 0;
         let mut ptr = 0;
         loop{
-            match self.find_frames(process, need){
+            match self.find_frames(process, nb_frames-attr){
                 Some(mut rep)=>{
                     match rep.1{
                         AllocResult::AllocSuccess=>{
@@ -191,7 +192,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
                                 rep.0.addr.pos = ptr;
                                 ptr = (x * self.frame_size()) as u32;
                                 self.ids[pos] = Some(rep.0);
-                                if attr==need{return (Some(VirtualAddr::new(process,0)),AllocResult::AllocSuccess)}
+                                if attr==nb_frames{return (Some(VirtualAddr::new(process,0)),AllocResult::AllocSuccess)}
                             }
                             else{return (Some(VirtualAddr::new(process,0)),AllocResult::AllocPartial(attr))}
 
@@ -266,29 +267,39 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
                 }
             }
         }
-        for id in 0..max{
-            // Unload Physical and Virtual
-            if self.free_phys(self.ids[id].unwrap().frame){
-                self.ids[id] = None;
-            }
-            else{
-                self.quarantine(self.ids[id].unwrap().frame);
-                self.ids[id] = None;
-            }
+        for id in ids{
+            match id{
+                Some(x)=>{
+                    if self.free_phys(self.ids[x].unwrap().frame){
+                        self.ids[x] = None;
+                    }
+                    else{
+                        self.quarantine(self.ids[x].unwrap().frame);
+                        self.ids[x] = None;
+                    }
+                },
+                None=>{break}
+            }   
         }
         if !self.empty_quarantine(){DesallocResult::MemoryLeak}
         else{DesallocResult::DesallocSuccess}
         
     }
     fn empty_quarantine(&self)->bool{
-        for i in self.anoms.0{if i.is_some(){return false}}
+        for i in self.anoms.0.iter(){if i.is_some(){return false}}
         true
     }
     fn quarantine(&mut self,id:PhysFrame){
-        self.anoms.0[self.anoms.1] = Some(id);
-        self.anoms.1 += 1;
+        if self.anoms.1 ==self.anoms.0.len()-1{
+            self.purge();
+            self.anoms.0[self.anoms.1] = Some(id);
+        }
+        else{
+            self.anoms.0[self.anoms.1] = Some(id);
+            self.anoms.1 += 1;
+        }
     }
-    fn force_unlock(&mut self){
+    pub fn purge(&mut self){
         for pf in self.anoms.0{
             if let Some(slot) = pf{
                 let rng = (slot.frame[0],slot.frame[0]+slot.frame[1]);
@@ -296,6 +307,8 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
             }
             else{break}
         }
+        for pf in self.anoms.0.iter_mut(){*pf = None;}
+        self.anoms.1 = 0;
     }
 }
 const fn sqrt2(mut size:usize)->bool{
@@ -308,7 +321,7 @@ const fn sqrt2(mut size:usize)->bool{
 
 #[cfg(test)]
 mod tests{
-    use crate::Allocator;
+    use crate::{AllocResult, Allocator, DesallocResult};
     #[test]
     fn test_generate(){
         let a = Allocator::<4096,64,64>::new();
@@ -360,5 +373,88 @@ mod tests{
         a.bitmap[3]=0;
         a.alloc_phys(1).unwrap();
         assert_eq!(a.bitmap[2],1)
+    }
+    #[test]
+    fn status_alloc(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        assert_eq!((res.0.is_some(),res.1),(true,AllocResult::AllocSuccess));
+    }
+    #[test]
+    fn inspect_alloc_virt(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        let mut count = 0;
+        for i in a.ids.iter(){
+            if let Some(virt) = i{
+                if virt.addr == res.0.unwrap(){count+=1;}
+            }
+        }
+        assert_eq!(count!=0,true)
+    }
+    #[test]
+    fn verify_down_virt_to_phys(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        a.alloc(8, 256);
+        let mut count = 0;
+        for i in a.bitmap{
+            if i==1{count +=1};
+        }
+        assert_eq!(count!=0,true)
+    }
+    #[test]
+    fn status_desalloc(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        let status = a.desalloc(res.0.unwrap().get_pid());
+        assert_eq!(status,DesallocResult::DesallocSuccess)
+    }
+    #[test]
+    fn inspect_desalloc_virt(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        a.desalloc(res.0.unwrap().get_pid());
+        let mut count = 0;
+        for i in a.ids.iter(){
+            if let Some(virt) = i{
+                if virt.addr == res.0.unwrap(){count+=1;}
+            }
+        }
+        assert_eq!(count==0,true)
+    }
+    #[test]
+    fn inspect_quarantine_force_corruption(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        a.bitmap[0] = 0;
+        let res = a.desalloc(res.0.unwrap().get_pid());
+        assert_eq!(res,DesallocResult::MemoryLeak)
+    }
+    #[test]
+    fn inspect_status_quarantine(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        a.bitmap[0] = 0;
+        a.desalloc(res.0.unwrap().get_pid());
+        let mut count = 0;
+        for i in a.anoms.0.iter(){if i.is_some(){count+=1;}}
+        assert_eq!(count!=0,true)
+    }
+    #[test]
+    fn test_purge(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        a.bitmap[0] = 0;
+        a.desalloc(res.0.unwrap().get_pid());
+        a.purge();
+        let mut c1 = 0;
+        let mut c2 = 0;
+        for i in a.bitmap.iter(){
+            if *i==1{c1+=1}
+        }
+        for i in a.anoms.0.iter(){
+            if i.is_some(){c2+=1}
+        }
+        assert_eq!(c1==0&&c2==0&&a.anoms.1==0,true)
     }
 }
