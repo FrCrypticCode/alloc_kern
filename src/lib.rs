@@ -48,13 +48,15 @@ pub enum AllocResult{
 #[derive(Debug)]
 pub enum DesallocResult{
     DesallocSuccess,
-    AlreadyFree
+    AlreadyFree,
+    MemoryLeak,
 }
 type IdFrame = usize;   
 pub struct Allocator<const N:usize,const S:usize,const F:usize>{
     bytes:[u8;N],
     ids:[Option<IdEntry>;S],
     bitmap:[u8;F],
+    anoms:([Option<PhysFrame>;F],usize),
     offset:usize,
 }
 impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
@@ -66,7 +68,7 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         None
     }
     const fn generate()->Self{
-        Self { bytes:[0;N],ids:[None;S],bitmap:[0;F], offset: 0 }
+        Self { bytes:[0;N],ids:[None;S],bitmap:[0;F],anoms:([None;F],0), offset: 0 }
     }
     // Size Accessors
     const fn slots(&self)->usize{return self.bitmap.len()}
@@ -142,7 +144,8 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
                 }
                 true
             },
-            DesallocResult::AlreadyFree=>{false}
+            DesallocResult::AlreadyFree=>{false},
+            _=>{false} // Nothing arrive here
         }
     }
     fn verify_desalloc(&self,rng:(IdFrame,IdFrame))->DesallocResult{
@@ -253,7 +256,46 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         return nb
     }
     pub fn desalloc(&mut self,process:u16)->DesallocResult{
-        DesallocResult::DesallocSuccess
+        let mut ids:[Option<usize>;S] = [None;S];
+        let mut max = 0;
+        for (id,entry) in self.ids.iter().enumerate(){
+            if entry.is_some(){
+                if entry.unwrap().addr.get_pid() == process{
+                    ids[max] = Some(id);
+                    max += 1;
+                }
+            }
+        }
+        for id in 0..max{
+            // Unload Physical and Virtual
+            if self.free_phys(self.ids[id].unwrap().frame){
+                self.ids[id] = None;
+            }
+            else{
+                self.quarantine(self.ids[id].unwrap().frame);
+                self.ids[id] = None;
+            }
+        }
+        if !self.empty_quarantine(){DesallocResult::MemoryLeak}
+        else{DesallocResult::DesallocSuccess}
+        
+    }
+    fn empty_quarantine(&self)->bool{
+        for i in self.anoms.0{if i.is_some(){return false}}
+        true
+    }
+    fn quarantine(&mut self,id:PhysFrame){
+        self.anoms.0[self.anoms.1] = Some(id);
+        self.anoms.1 += 1;
+    }
+    fn force_unlock(&mut self){
+        for pf in self.anoms.0{
+            if let Some(slot) = pf{
+                let rng = (slot.frame[0],slot.frame[0]+slot.frame[1]);
+                self.unlock(rng);
+            }
+            else{break}
+        }
     }
 }
 const fn sqrt2(mut size:usize)->bool{
