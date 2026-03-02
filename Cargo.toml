@@ -1,10 +1,18 @@
 [package]
 name = "alloc_kern"
 version = "0.1.0"
-edition = "2024"
+edition = "2021" 
+description = "A no_std physical + virtual memory allocator with fragmentation handling, quarantine system, and safe IO API."
+readme = "README.md"
+license = "BSD-2-Clause"
+repository = "https://github.com/FrCrypticCode/alloc_kern"
+keywords = ["allocator", "no_std", "memory", "virtual", "kernel"]
+categories = ["memory-management", "no-std", "embedded", "os"]
+authors = ["Damien Durand <damien_501@hotmail.fr>"]
 
 [lib]
 name = "alloc_kern"
 path = "src/lib.rs"
+crate-type = ["rlib"]
 
 [dependencies]
