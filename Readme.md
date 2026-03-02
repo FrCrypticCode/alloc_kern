@@ -1,3 +1,6 @@
+[![Crates.io](https://img.shields.io/crates/v/alloc_kern.svg)](https://crates.io/crates/alloc_kern)
+[![Docs.rs](https://img.shields.io/docsrs/alloc_kern)](https://docs.rs/alloc_kern)
+
 Allocator — A no_std Physical & Virtual Memory Allocator in Rust
 This project provides a fully‑featured memory allocator designed for no_std environments.
 It includes:
