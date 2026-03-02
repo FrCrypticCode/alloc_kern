@@ -1,19 +1,80 @@
-#![no_std]
 
+//! # Allocator — Physical & Virtual Memory Manager
+//!
+//! This module implements a `no_std` memory allocator supporting:
+//! - physical frame allocation
+//! - virtual segmentation
+//! - fragmentation handling
+//! - safe read/write IO
+//! - quarantine anti‑leak system
+//!
+//! ## Design overview
+//! - `pos` is a byte offset in virtual memory
+//! - segments do not overlap for a given process
+//! - physical memory is backed by a bitmap
+//! - read/write operations strictly forbid page crossing
+
+
+//! # Virtual memory (always contiguous):
+//! Frame size = 32 bytes
+//!
+//!     pos = 0       pos = 64       pos = 96
+//!     +------------+------------+------------+
+//!     | segment 0  | segment 1  | segment 2  |
+//!     +------------+------------+------------+
+//!
+//! # Physical frames
+//!
+//!     [.##...........#...........##.........]
+//!       ^             ^             ^
+//!       S0            S1            S2
+//!
+//! Virtual memory remains contiguous even when physical memory is fragmented.
+//!
+//! # In case of a memory leak
+//! (missing IdEntry, corrupted entry, or incomplete segment)
+//!
+//! Virtual memory  → always clean
+//!
+//!     [#..#.................................]
+//!      ^  ^
+//!     S0  S2
+//!
+//! Physical memory → leak remains locked/unusable
+//!
+//!     [.##...........#...........##.........]
+//!       ^             ^             ^
+//!      S0            S1            S2
+//!
+//! # Quarantine state
+//!
+//!     [#....................................]
+//!      ^
+//!     &S1    ← quarantined segment (failed free)
+//!
+//! You can inspect the state using `empty_quarantine()`
+//! You can clean quarantined blocks using `purge()`
+
+
+#![no_std]
 use core::ops::Deref;
 
+/// IdEntry represents a part in Virtual Memory which is link to one or many Physical frames
 #[derive(Clone,Copy)]
 struct IdEntry{
     addr:VirtualAddr,
     frame:PhysFrame
 }
 
+/// VirtualAddr is the virtual pointer for an IdEntry
+/// In the case which the Process has many IdEntry, attribut pos is align with the others parts
 #[derive(Clone,Copy,PartialEq)]
 pub struct VirtualAddr{
     id:u16,
     pos:u32,    // Offset Virtual Memory
 }
 impl VirtualAddr{
+    /// Link the pid and the offset to generate the address
     pub fn new(id:u16,pos:u32)->Self{
         VirtualAddr {id, pos}
     }
@@ -21,6 +82,9 @@ impl VirtualAddr{
     pub fn get_pos(&self)->u32{self.pos}
 }
 
+// # Slice of physical frame
+// 0 is the ID in array
+// 1 the number of frames in the slice
 #[derive(Clone,Copy)]
 struct PhysFrame{
     frame:[IdFrame;2],
@@ -53,6 +117,21 @@ pub enum DesallocResult{
 }
 type IdFrame = usize;   
 type Octets = usize;
+#[derive(Debug,PartialEq)]
+pub enum IoStatus<const L:usize>{
+    ReadOk([u8;L]),
+    WriteOk,
+    OutOfRangeLow,
+    OutOfRangeHigh,
+    NoSegment
+}
+
+/// # Allocator 
+/// You need to declared it with 3 constants
+/// N is the length of bytes you're manage in you RAM
+/// F the number of frames you want
+/// S the number of virtual entries you 
+/// => N need to be a multiple of 2 of F !!!
 pub struct Allocator<const N:usize,const S:usize,const F:usize>{
     bytes:[u8;N],
     ids:[Option<IdEntry>;S],
@@ -61,7 +140,7 @@ pub struct Allocator<const N:usize,const S:usize,const F:usize>{
     offset:usize,
 }
 impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
-    // Constructor
+    /// Constructor required the constants N S and F
     pub fn new()->Option<Self>{
         if N>0 && F>0 && N>F && sqrt2(N) && sqrt2(F) && N%F==0{
             return Some(Self::generate())
@@ -162,15 +241,20 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         let rngbytes = (rng.0*self.frame_size(),rng.1*self.frame_size());
         for b in self.bytes[rngbytes.0..rngbytes.1].iter_mut(){*b = 0}
     }
-    //
-    //Virtualize Part - Octet Need
-    pub fn alloc(&mut self,process:u16,need:Octets)->(Option<VirtualAddr>,AllocResult){ // ->Result<(*mut u8,AllocResult)>
+    /// # Description
+    /// Alloc lock a slice of memory for your process and
+    /// return a tuple with VirtualAddress and a status of the process
+    /// 
+    /// # Status
+    /// You can have three types :
+    /// NotEnoughMemory => Allocator cannot find any block for you
+    /// AllocPartial(v) => Return v size of memory lock, allocator try to allocate even if he didn't have enough space
+    /// AllocSuccess => It find your memory, in case if their are not contiguous, it return AllocSuccess too 
+    pub fn alloc(&mut self,process:u16,need:Octets)->(Option<VirtualAddr>,AllocResult){ 
         // Estimate number of frames need
         let nb_frames:usize;
         if need%self.frame_size()!=0{nb_frames=need/self.frame_size()+1;}
         else{nb_frames=need /self.frame_size();}
-        // Checking if we have enough memory
-        // One Virtual Slot = One Slice of PhysFrame resumed as struct PhysFrame
         let free_frame =self.nb_phys_frame();
         if free_frame<nb_frames || self.nb_virt_free()==0{
             return (None,AllocResult::NotEnoughMemory)
@@ -256,6 +340,10 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         for i in self.bitmap.iter(){if *i==0{nb+=1;}}
         return nb
     }
+    /// # Desalloc
+    /// Desalloc remove a lock on memory and return the status of the process
+    /// In case of Memory Leaks, desalloc remove IdEntry and add frames in quarantine
+    /// If quarantine is full, an automatic purge is initialized
     pub fn desalloc(&mut self,process:u16)->DesallocResult{
         let mut ids:[Option<usize>;S] = [None;S];
         let mut max = 0;
@@ -285,7 +373,9 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         else{DesallocResult::DesallocSuccess}
         
     }
-    fn empty_quarantine(&self)->bool{
+    /// # Quarantine - An index for memory leaks
+    /// Return if the quarantine space of Allocator is empty
+    pub fn empty_quarantine(&self)->bool{
         for i in self.anoms.0.iter(){if i.is_some(){return false}}
         true
     }
@@ -299,6 +389,8 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
             self.anoms.1 += 1;
         }
     }
+    /// # To fight Memory Leaks, you need to burn it
+    /// If you have some memory leaks, you can ask manually the allocator to remove them
     pub fn purge(&mut self){
         for pf in self.anoms.0{
             if let Some(slot) = pf{
@@ -309,6 +401,60 @@ impl<const N:usize, const S:usize,const F:usize> Allocator<N,S,F>{
         }
         for pf in self.anoms.0.iter_mut(){*pf = None;}
         self.anoms.1 = 0;
+    }
+    /// # Read
+    /// Return an IoStatus which can contains data [u8] or error API
+    /// If your read request is OK, you can find an ReadOk() status
+    pub fn read<const L:usize>(&self,process:u16,addr:VirtualAddr)->IoStatus<L>{
+        for i in self.ids.iter(){
+            if let Some(entry)= i{
+                let virt_base_entry = entry.addr.pos as usize;
+                if (addr.pos as usize) < virt_base_entry{
+                    return IoStatus::OutOfRangeLow // Underflow
+                }
+                let virt_len = entry.frame.get_size() * self.frame_size();
+                let offset = (addr.pos as usize) - virt_base_entry;
+                if entry.addr.get_pid() == process 
+                && (addr.pos as usize) <= virt_base_entry + virt_len
+                && (addr.pos as usize)+L <= virt_base_entry + virt_len {
+                    // readbytes
+                    let align = entry.frame.deref()*self.frame_size() + offset;
+                    if ((offset % self.frame_size()) + L) >= self.frame_size(){
+                        return IoStatus::OutOfRangeHigh // Chevauchement
+                    }
+                    let mut bytes:[u8;L]= [0;L];
+                    bytes.copy_from_slice(&self.bytes[align..align+L]);
+                    return IoStatus::ReadOk(bytes)
+                }
+            }
+        }
+        IoStatus::NoSegment
+    }
+    /// # Write
+    /// Return an IoStatus which not contains any data.
+    pub fn write<const L:usize>(&mut self,process:u16,addr:VirtualAddr,bytes:&[u8;L])->IoStatus<L>{
+        for i in self.ids.iter(){
+            if let Some(entry)= i{
+                let virt_base_entry = entry.addr.pos as usize;
+                if (addr.pos as usize) < virt_base_entry{
+                    return IoStatus::OutOfRangeLow // Underflow
+                }
+                let virt_len = entry.frame.get_size() * self.frame_size();
+                let offset = (addr.pos as usize) - virt_base_entry;
+                if entry.addr.get_pid() == process 
+                && (addr.pos as usize) <= virt_base_entry + virt_len
+                && (addr.pos as usize)+L <= virt_base_entry + virt_len {
+                    // readbytes
+                    let align = entry.frame.deref()*self.frame_size() + offset;
+                    if ((offset % self.frame_size()) + L) >= self.frame_size(){
+                        return IoStatus::OutOfRangeHigh// Chevauchement
+                    }
+                    self.bytes[align..align+L].copy_from_slice(bytes);
+                    return IoStatus::WriteOk
+                }
+            }
+        }
+        IoStatus::NoSegment
     }
 }
 const fn sqrt2(mut size:usize)->bool{
@@ -321,7 +467,7 @@ const fn sqrt2(mut size:usize)->bool{
 
 #[cfg(test)]
 mod tests{
-    use crate::{AllocResult, Allocator, DesallocResult};
+    use crate::{AllocResult, Allocator, DesallocResult, IoStatus};
     #[test]
     fn test_generate(){
         let a = Allocator::<4096,64,64>::new();
@@ -456,5 +602,53 @@ mod tests{
             if i.is_some(){c2+=1}
         }
         assert_eq!(c1==0&&c2==0&&a.anoms.1==0,true)
+    }
+    #[test]
+    fn read_and_write(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        let addr = res.0.unwrap();
+        let bytes: &[u8;13] = b"Hello World !";
+        a.write(8, addr, bytes);
+        let res = a.read(8, addr);
+        assert_eq!(res,IoStatus::ReadOk(*bytes))
+    }
+    #[test]
+    fn read_and_write_with_offset(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        let mut addr = res.0.unwrap();
+        addr.pos += 15;
+        let bytes: &[u8;13] = b"Hello World !";
+        a.write(8, addr, bytes);
+        let res = a.read(8, addr);
+        assert_eq!(res,IoStatus::ReadOk(*bytes))
+    }
+    #[test]
+    fn out_of_range(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        let mut addr = res.0.unwrap();
+        addr.pos += 2027;
+        let bytes: &[u8;13] = b"Hello World !";
+        let res = a.write(8, addr, bytes);
+        assert_eq!(res,IoStatus::NoSegment)
+    }
+    #[test]
+    fn access_denied(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        let addr = res.0.unwrap();
+        let bytes: &[u8;13] = b"Hello World !";
+        assert_eq!(a.write(1, addr,bytes),IoStatus::NoSegment)
+    }
+    #[test]
+    fn underflow(){
+        let mut a = Allocator::<4096,64,64>::new().unwrap();
+        let res = a.alloc(8, 256);
+        let mut addr = res.0.unwrap();
+        addr.pos += (a.frame_size()-1) as u32;
+        let bytes: &[u8;13] = b"Hello World !";
+        assert_eq!(a.write(8, addr,bytes),IoStatus::OutOfRangeHigh)
     }
 }
